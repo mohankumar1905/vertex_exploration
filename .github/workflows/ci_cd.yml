@@ -1,0 +1,83 @@
+name: CI/CD Deploy to Vertex AI
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies (optional, for linting/tests)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: "access_token"
+          workload_identity_provider: ${{ secrets.GCP_WIP }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev
+
+      - name: Build Docker image
+        run: |
+          IMAGE_TAG=${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/vertex-repo/fastapi-vertex:${{ github.sha }}
+          docker build -t $IMAGE_TAG .
+
+      - name: Push Docker image to Artifact Registry
+        run: |
+          docker push $IMAGE_TAG
+
+      - name: Deploy to Vertex AI Endpoint
+        env:
+          IMAGE_TAG: ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/vertex-repo/fastapi-vertex:${{ github.sha }}
+        run: |
+          # Create a model from the custom container (if not exists)
+          MODEL_NAME="fastapi-model-${{ github.sha }}"
+          gcloud ai models upload \
+            --region=${{ secrets.GCP_REGION }} \
+            --display-name=$MODEL_NAME \
+            --container-image-uri=$IMAGE_TAG \
+            --container-health-route="/" \
+            --container-predict-route="/"
+
+          # Get the model resource name
+          MODEL_RESOURCE=$(gcloud ai models list --region=${{ secrets.GCP_REGION }} --filter="displayName=$MODEL_NAME" --format="value(name)")
+
+          # Deploy the model to an existing endpoint (create endpoint if needed)
+          ENDPOINT_NAME="fastapi-endpoint"
+          ENDPOINT_RESOURCE=$(gcloud ai endpoints list --region=${{ secrets.GCP_REGION }} --filter="displayName=$ENDPOINT_NAME" --format="value(name)")
+          if [ -z "$ENDPOINT_RESOURCE" ]; then
+            ENDPOINT_RESOURCE=$(gcloud ai endpoints create --region=${{ secrets.GCP_REGION }} --display-name=$ENDPOINT_NAME --format="value(name)")
+          fi
+
+          # Deploy model to endpoint
+          gcloud ai endpoints deploy-model $ENDPOINT_RESOURCE \
+            --region=${{ secrets.GCP_REGION }} \
+            --model=$MODEL_RESOURCE \
+            --display-name="fastapi-deployment-${{ github.sha }}" \
+            --machine-type=n1-standard-2 \
+            --traffic-split=0=100
